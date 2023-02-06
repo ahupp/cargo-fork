@@ -23,9 +23,7 @@ use tokio_tar::Archive;
 use tokio_util::io::StreamReader;
 use futures_util::TryStreamExt;
 use toml_edit::{InlineTable, Value, Item, Table};
-use clap::{Parser, ValueEnum};
-
-static USER_AGENT: &str = "TODO";
+use clap::Parser;
 
 #[derive(Clone)]
 struct VcsInfo {
@@ -117,30 +115,34 @@ async fn lookup_vcs_revision(crate_name: &str, version: &Version) -> Result<Opti
 }
 
 
-#[derive(Debug, Clone, ValueEnum, Eq, PartialEq)]
-#[clap(rename_all = "kebab_case")]
+#[derive(clap::ValueEnum, Debug, Clone, Eq, PartialEq)]
 enum Source {
+    /// Patch with the contents of the crate uploaded to crates.io
     Crate,
+    /// Patch with the VCS HEAD revision
     VCSHead,
+    /// Patch with the VCS revision corresponding to the current crate version
     VCSCurrent,
 }
 
-#[derive(Parser, Debug)]
+#[derive(clap::Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    #[clap(long, value_enum, default_value_t = Source::VCSHead)]
+    #[arg(long, value_enum, default_value_t = Source::VCSCurrent)]
     source: Source,
 
-    #[clap(long)]
+    #[arg(long)]
     dest_dir: Option<PathBuf>,
 
-    #[clap()]
-    package_name: String,
+    #[arg()]
+    crate_name: String,
 }
 
-async fn package_get_repo(package_name: &str) -> anyhow::Result<Url> {
+async fn crate_get_repo(package_name: &str) -> anyhow::Result<Url> {
+    let user_agent = format!("cargo-fork/{} (https://github.com/ahupp/cargo-fork)", clap::crate_version!());
+
     let crates_io_client = crates_io_api::AsyncClient::new(
-        USER_AGENT,
+        &user_agent,
         Duration::from_millis(1000))?;
 
     let crate_info = crates_io_client.get_crate(package_name).await?;
@@ -150,7 +152,7 @@ async fn package_get_repo(package_name: &str) -> anyhow::Result<Url> {
     Ok(Url::parse(&repo_str)?)
 }
 
-fn toml_table_by_path<'a>(path: &[&str], table: &'a mut Table) -> anyhow::Result<&'a mut Table> {
+fn toml_get_or_create_table_by_path<'a>(path: &[&str], table: &'a mut Table) -> anyhow::Result<&'a mut Table> {
     let mut current = table;
     for key in path {
         current = current.entry(key)
@@ -163,17 +165,19 @@ fn toml_table_by_path<'a>(path: &[&str], table: &'a mut Table) -> anyhow::Result
     Ok(current)
 }
 
-fn cargo_meta_to_depmap(metadata: &Metadata) -> HashMap<&PackageId, HashSet<&PackageId>> {
-    let resolve = metadata.resolve.as_ref().expect("metadata resolve missing");
-    HashMap::from_iter(
-        resolve.nodes.iter().map(|node| (
-            &node.id,
-            node.dependencies.iter().collect()
-        )
-    ))
-}
 
 fn print_changed_deps(metadata_before: &Metadata, metadata_after: &Metadata) {
+    /// Given the output of `cargo metadata`, return a map from PackageId to the set of PackageIds it depends on
+    fn cargo_meta_to_depmap(metadata: &Metadata) -> HashMap<&PackageId, HashSet<&PackageId>> {
+        let resolve = metadata.resolve.as_ref().expect("metadata resolve missing");
+        HashMap::from_iter(
+            resolve.nodes.iter().map(|node| (
+                &node.id,
+                node.dependencies.iter().collect()
+            )
+        ))
+    }
+
     let depmap_after = cargo_meta_to_depmap(&metadata_after);
     let depmap_before = cargo_meta_to_depmap(&metadata_before);
 
@@ -191,15 +195,17 @@ fn print_changed_deps(metadata_before: &Metadata, metadata_after: &Metadata) {
             for dep in add_dep {
                 println!("  + {}", dep);
             }
+        } else {
+            println!("+{}:", pkg_id);
         }
     }
 }
 
 fn manifest_insert_patch(manifest: &mut Manifest, package_name: &str, patch_dir: &Path) -> Result<()> {
 
-    let doc = &mut manifest.data;
+    let root_table = manifest.data.as_table_mut();
 
-    let patch_table = toml_table_by_path(&["patch", "crates-io"], doc)?;
+    let patch_table = toml_get_or_create_table_by_path(&["patch", "crates-io"], root_table)?;
 
     patch_table[&package_name] = {
         let mut dep = InlineTable::new();
@@ -271,7 +277,7 @@ async fn unpack_crate_archive(tmpdir: &TempDir, package_name: &str, package_vers
     for entry in fs::read_dir(&tmpdir)? {
         let entry = entry?;
         if let Some(_) = cur_path {
-            bail!("More than one root entry in crate archive");
+            bail!("More than one root entry in crate archive for {}-{}", package_name, package_version);
         } else {
             cur_path = Some(entry.path());
         }
@@ -299,9 +305,9 @@ async fn main() -> Result<()> {
     println!("Using manifest: {}", manifest_path.display());
 
     let package_meta = metadata_before.packages.iter()
-        .find(|pkg| pkg.name == args.package_name)
+        .find(|pkg| pkg.name == args.crate_name)
         .ok_or_else(|| {
-            anyhow!("Package {} is not a dependency", args.package_name)
+            anyhow!("Package {} is not a dependency", args.crate_name)
         })?;
 
     let workspace_parent= workspace_root.parent().unwrap();
@@ -309,7 +315,7 @@ async fn main() -> Result<()> {
     let patch_dir = if args.source == Source::Crate {
 
         let tmpdir = tempfile::TempDir::new()?;
-        let archive_root = unpack_crate_archive(&tmpdir, &args.package_name, &package_meta.version).await?;
+        let archive_root = unpack_crate_archive(&tmpdir, &args.crate_name, &package_meta.version).await?;
 
         let patch_root = args.dest_dir.unwrap_or_else(|| workspace_parent.join(archive_root.file_name().unwrap()));
         if patch_root.try_exists()? {
@@ -318,13 +324,13 @@ async fn main() -> Result<()> {
         fs::rename(&archive_root, &patch_root)?;
         patch_root
     } else {
-        let repo_url = package_get_repo(&args.package_name).await?;
+        let repo_url = crate_get_repo(&args.crate_name).await?;
 
         let final_segment = repo_url.path_segments().unwrap().last().unwrap();
 
         let checkout_dir = args.dest_dir.unwrap_or_else(|| workspace_parent.join(&final_segment));
 
-        let current_vcs_info = lookup_vcs_revision(&args.package_name, &package_meta.version).await?;
+        let current_vcs_info = lookup_vcs_revision(&args.crate_name, &package_meta.version).await?;
 
         let revision = if args.source == Source::VCSHead {
             "HEAD"
@@ -333,7 +339,7 @@ async fn main() -> Result<()> {
             .as_ref()
             .ok_or_else(|| anyhow!(
                 "No .cargo_vcs_info.json for package {}:{}, try --source-vcs-head",
-                args.package_name, package_meta.version))?;
+                args.crate_name, package_meta.version))?;
             &vcinfo.hash
         };
 
@@ -343,8 +349,8 @@ async fn main() -> Result<()> {
             vcs_info.path_in_repo
         } else {
             let dep_metadata = query_metadata(&checkout_dir)?;
-            let pkg = dep_metadata.workspace_packages().into_iter().find(|p| p.name == args.package_name)
-                .ok_or_else(|| anyhow!("Failed to find package {} in repo {}", args.package_name, checkout_dir.display()))?;
+            let pkg = dep_metadata.workspace_packages().into_iter().find(|p| p.name == args.crate_name)
+                .ok_or_else(|| anyhow!("Failed to find package {} in repo {}", args.crate_name, checkout_dir.display()))?;
 
             pkg.manifest_path.parent().unwrap()
                 .strip_prefix(&checkout_dir).unwrap()
@@ -354,7 +360,7 @@ async fn main() -> Result<()> {
         checkout_dir.join(path_in_repo)
     };
 
-    manifest_insert_patch(&mut manifest, &args.package_name, &patch_dir)?;
+    manifest_insert_patch(&mut manifest, &args.crate_name, &patch_dir)?;
     println!("writing manifest: {}", manifest_path.display());
 
     let s = manifest.data.to_string();
@@ -366,7 +372,7 @@ async fn main() -> Result<()> {
         .args(&[
             "update", "--quiet",
             "--workspace",
-            "--package", &args.package_name,
+            "--package", &args.crate_name,
             "--manifest-path", &manifest_path.to_str().unwrap()])
         .current_dir(&workspace_root)
         .status()?;
