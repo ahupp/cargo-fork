@@ -21,4 +21,4 @@ tempfile = "3.3.0"
 tokio = {version = "1.21.0", features = ["full"]}
 tokio-tar = "0.3.0"
 tokio-util = { version = "0.7.3", features = ["io"] }
-toml_edit = "0.18"
+toml_edit = "0.19"
