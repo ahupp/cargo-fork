@@ -38,11 +38,17 @@ enum Source {
 #[derive(clap::Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
+    /// The source of the fork
     #[arg(long, value_enum, default_value_t = Source::VCSCurrent)]
     source: Source,
 
+    /// Override the location of the forked crate
     #[arg(long)]
     dest_dir: Option<PathBuf>,
+
+    /// Override the git repo to checkout from
+    #[arg(long)]
+    git: Option<Url>,
 
     #[arg()]
     crate_name: String,
@@ -120,7 +126,10 @@ async fn main() -> Result<()> {
         fs::rename(&tmpdir.path().join(&archive_root), &patch_root)?;
         patch_root
     } else {
-        let repo_url = crate_get_repo(&args.crate_name).await?;
+        let repo_url = match args.git {
+            Some(git_url) => git_url,
+            None => crate_get_repo(&args.crate_name).await?,
+        };
 
         // https://github.com/ahupp/cargo-fork -> cargo-fork
         let final_segment = repo_url.path_segments().unwrap().last().unwrap();
@@ -136,7 +145,7 @@ async fn main() -> Result<()> {
         } else {
             let vcinfo = vcs_info.as_ref().ok_or_else(|| {
                 anyhow!(
-                    "No .cargo_vcs_info.json for package {}:{}, try --source-vcs-head",
+                    "No .cargo_vcs_info.json for package {}:{}, try \"--source vcs-head\"",
                     args.crate_name,
                     package_meta.version
                 )

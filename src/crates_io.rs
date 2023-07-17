@@ -124,10 +124,12 @@ pub(crate) async fn crate_get_repo(package_name: &str) -> anyhow::Result<Url> {
         crates_io_api::AsyncClient::new(&user_agent, Duration::from_millis(1000))?;
 
     let crate_info = crates_io_client.get_crate(package_name).await?;
-    let repo_str = crate_info
-        .crate_data
-        .repository
-        .ok_or_else(|| anyhow!("Package {} does not specify a repository", package_name))?;
+    let repo_str = crate_info.crate_data.repository.ok_or_else(|| {
+        anyhow!(
+            "Package {} does not specify a repository, try \"--source crate\" or \"--git <some repo>\"",
+            package_name
+        )
+    })?;
 
     Ok(Url::parse(&repo_str)?)
 }
@@ -147,7 +149,7 @@ pub(crate) async fn unpack_crate_archive(
     let root = entries.nth(0);
     if let Some(entry) = root {
         if entries.count() != 0 {
-            bail!("more than one entry in crate archive")
+            bail!("Unexpected, more than one entry in crate archive")
         }
         let entry = entry?;
         Ok(PathBuf::from(entry.file_name()))
